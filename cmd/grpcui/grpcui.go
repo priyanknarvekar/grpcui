@@ -143,6 +143,8 @@ var (
 		an error to use both -authority and -servername (though this will be
 		permitted if they are both set to the same value, to increase backwards
 		compatibility with earlier releases that allowed both to be set).`))
+	title = flags.String("title", "", prettify(`
+		The page title associated with the web page.`))
 	openBrowser = flags.Bool("open-browser", false, prettify(`
 		When true, grpcui will try to open a browser pointed at the UI's URL.
 		This defaults to true when grpcui is used in an interactive mode; e.g.
@@ -643,6 +645,9 @@ func main() {
 	}
 	if verbosity > 0 {
 		handlerOpts = append(handlerOpts, standalone.WithInvokeVerbosity(verbosity))
+	}
+	if *title != "" {
+		handlerOpts = append(handlerOpts, standalone.WithTitle(*title))
 	}
 	if debug.set {
 		handlerOpts = append(handlerOpts, standalone.WithClientDebug(debug.val))

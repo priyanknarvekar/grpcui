@@ -15,6 +15,9 @@ type WebFormContainerTemplateData struct {
 	// Target is the name of the machine we are making requests to (for display purposes).
 	Target string
 
+	// PageTitle is the title of the page to show in the header.
+	PageTitle string
+
 	// WebFormContents is the generated form HTML from your ServiceDescriptors.
 	WebFormContents template.HTML
 
@@ -225,6 +228,13 @@ func WithGRPCOptions(options []string) HandlerOption {
 	})
 }
 
+// WithTitle sets the title of the web page.
+func WithTitle(title string) HandlerOption {
+	return optFunc(func(opts *handlerOptions) {
+		opts.title = title
+	})
+}
+
 // optFunc implements HandlerOption
 type optFunc func(opts *handlerOptions)
 
@@ -245,7 +255,9 @@ type handlerOptions struct {
 	emitDefaults        bool
 	invokeVerbosity     int
 	debug               *bool
+
 	gRPCurlOptions      []string
+	title               string
 }
 
 func (opts *handlerOptions) addlServedResources() []*resource {

@@ -82,7 +82,7 @@ func Handler(ch grpcdynamic.Channel, target string, methods []*desc.MethodDescri
 		GRPCurlOptions:  uiOpts.gRPCurlOptions,
 	}
 	webFormHTML := grpcui.WebFormContentsWithOptions("invoke", "metadata", target, methods, formOpts)
-	indexContents := getIndexContents(uiOpts.indexTmpl, target, webFormHTML, uiOpts.tmplResources)
+	indexContents := getIndexContents(uiOpts.indexTmpl, target, uiOpts.title, webFormHTML, uiOpts.tmplResources)
 	indexResource := newResource("/", indexContents, "text/html; charset=utf-8", false)
 	indexResource.MustRevalidate = true
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -145,7 +145,7 @@ func Handler(ch grpcdynamic.Channel, target string, methods []*desc.MethodDescri
 
 var defaultIndexTemplate = template.Must(template.New("index.html").Parse(string(standalone.IndexTemplate())))
 
-func getIndexContents(tmpl *template.Template, target string, webFormHTML []byte, addlResources []*resource) []byte {
+func getIndexContents(tmpl *template.Template, target, title string, webFormHTML []byte, addlResources []*resource) []byte {
 	addlHTML := make([]template.HTML, 0, len(addlResources))
 	for _, res := range addlResources {
 		tag := res.AsHTMLTag()
@@ -155,6 +155,7 @@ func getIndexContents(tmpl *template.Template, target string, webFormHTML []byte
 	}
 	data := WebFormContainerTemplateData{
 		Target:          target,
+		PageTitle:       title,
 		WebFormContents: template.HTML(webFormHTML),
 		AddlResources:   addlHTML,
 	}
