@@ -410,10 +410,11 @@ func main() {
 		fail(nil, "The -cert and -key arguments must be used together and both be present.")
 	}
 
-	if flags.NArg() != 1 {
-		fail(nil, "This program requires exactly one arg: the host:port of gRPC server.")
+	if flags.NArg() < 1 {
+		fail(nil, "This program requires at least one arg: the host:port of a gRPC server.")
 	}
-	target := flags.Arg(0)
+	targets := flags.Args()
+	target := targets[0] // primary target (used for single-endpoint path & display)
 
 	if len(protoset) > 0 && len(reflHeaders) > 0 {
 		warn("The -reflect-header argument is not used when -protoset files are used.")
@@ -569,99 +570,150 @@ func main() {
 		fail(err, "Failed to dial target host %q", target)
 	}
 
-	var descSource grpcurl.DescriptorSource
-	var refClient *grpcreflect.Client
-	var fileSource grpcurl.DescriptorSource
-	if len(protoset) > 0 {
-		var err error
-		fileSource, err = grpcurl.DescriptorSourceFromProtoSets(protoset...)
-		if err != nil {
-			fail(err, "Failed to process proto descriptor sets.")
-		}
-	} else if len(protoFiles) > 0 {
-		var err error
-		fileSource, err = grpcurl.DescriptorSourceFromProtoFiles(importPaths, protoFiles...)
-		if err != nil {
-			fail(err, "Failed to process proto source files.")
-		}
-	}
-	if reflection.val {
-		md := grpcurl.MetadataFromHeaders(append(addlHeaders, reflHeaders...))
-		refCtx := metadata.NewOutgoingContext(ctx, md)
-		refClient = grpcreflect.NewClientAuto(refCtx, cc)
-		refClient.AllowMissingFileDescriptors()
-		reflSource := grpcurl.DescriptorSourceFromServer(ctx, refClient)
-		if fileSource != nil {
-			descSource = compositeSource{reflSource, fileSource}
-		} else {
-			descSource = reflSource
-		}
-	} else {
-		descSource = fileSource
+	// -----------------------------------------------------------------------
+	// Dial all targets (starting with the already-dialed primary) and build a
+	// handler per endpoint.
+	// -----------------------------------------------------------------------
+
+	type connState struct {
+		cc        *grpc.ClientConn
+		refClient *grpcreflect.Client
 	}
 
-	// arrange for the RPCs to be cleanly shutdown
-	reset := func() {
+	buildEndpointHandler := func(cc *grpc.ClientConn, t string) (http.Handler, *grpcreflect.Client) {
+		var descSource grpcurl.DescriptorSource
+		var refClient *grpcreflect.Client
+		var fileSource grpcurl.DescriptorSource
+		if len(protoset) > 0 {
+			var err error
+			fileSource, err = grpcurl.DescriptorSourceFromProtoSets(protoset...)
+			if err != nil {
+				fail(err, "Failed to process proto descriptor sets.")
+			}
+		} else if len(protoFiles) > 0 {
+			var err error
+			fileSource, err = grpcurl.DescriptorSourceFromProtoFiles(importPaths, protoFiles...)
+			if err != nil {
+				fail(err, "Failed to process proto source files.")
+			}
+		}
+		if reflection.val {
+			md := grpcurl.MetadataFromHeaders(append(addlHeaders, reflHeaders...))
+			refCtx := metadata.NewOutgoingContext(ctx, md)
+			refClient = grpcreflect.NewClientAuto(refCtx, cc)
+			refClient.AllowMissingFileDescriptors()
+			reflSource := grpcurl.DescriptorSourceFromServer(ctx, refClient)
+			if fileSource != nil {
+				descSource = compositeSource{reflSource, fileSource}
+			} else {
+				descSource = reflSource
+			}
+		} else {
+			descSource = fileSource
+		}
+
+		epMethods, err := getMethods(descSource, configs)
+		if err != nil {
+			fail(err, "Failed to compute set of methods to expose for %q", t)
+		}
+		allFiles, err := grpcurl.GetAllFiles(descSource)
+		if err != nil {
+			fail(err, "Failed to enumerate all proto files for %q", t)
+		}
+
+		// Close reflection client now that schema is resolved.
 		if refClient != nil {
 			refClient.Reset()
 			refClient = nil
 		}
-		if cc != nil {
-			cc.Close()
-			cc = nil
+
+		var hopts []standalone.HandlerOption
+		if len(defHeaders) > 0 {
+			hopts = append(hopts, standalone.WithDefaultMetadata(defHeaders))
+		}
+		if len(addlHeaders) > 0 || len(rpcHeaders) > 0 {
+			hopts = append(hopts, standalone.WithMetadata(append(addlHeaders, rpcHeaders...)))
+		}
+		if len(prsvHeaders) > 0 {
+			hopts = append(hopts, standalone.PreserveHeaders(prsvHeaders))
+		}
+		if verbosity > 0 {
+			hopts = append(hopts, standalone.WithInvokeVerbosity(verbosity))
+		}
+		if *title != "" {
+			hopts = append(hopts, standalone.WithTitle(*title))
+		}
+		if debug.set {
+			hopts = append(hopts, standalone.WithClientDebug(debug.val))
+		}
+		if examplesOpt != nil {
+			hopts = append(hopts, examplesOpt)
+		}
+		hopts = append(hopts, standalone.EmitDefaults(*emitDefaults))
+		hopts = append(hopts, configureJSandCSS(extraJS, standalone.AddJSFile)...)
+		hopts = append(hopts, configureJSandCSS(extraCSS, standalone.AddCSSFile)...)
+		hopts = append(hopts, configureAssets(otherAssets)...)
+		hopts = append(hopts, standalone.WithGRPCOptions(gRPCOptions))
+
+		return standalone.Handler(cc, t, epMethods, allFiles, hopts...), refClient
+	}
+
+	// collect all connections so we can close them on exit
+	var conns []connState
+
+	// Build handler for the primary (already-dialed) target.
+	primaryHandler, primaryRefClient := buildEndpointHandler(cc, target)
+	conns = append(conns, connState{cc: cc, refClient: primaryRefClient})
+
+	endpoints := []standalone.EndpointInfo{{Target: target, Handler: primaryHandler}}
+
+	// Dial any additional targets.
+	for _, t := range targets[1:] {
+		extraCC, err := dial(dialCtx, network, t, creds, *connectFailFast, opts...)
+		if err != nil {
+			fail(err, "Failed to dial target host %q", t)
+		}
+		epHandler, epRefClient := buildEndpointHandler(extraCC, t)
+		conns = append(conns, connState{cc: extraCC, refClient: epRefClient})
+		endpoints = append(endpoints, standalone.EndpointInfo{Target: t, Handler: epHandler})
+	}
+
+	resetAll := func() {
+		for i := range conns {
+			if conns[i].refClient != nil {
+				conns[i].refClient.Reset()
+				conns[i].refClient = nil
+			}
+			if conns[i].cc != nil {
+				conns[i].cc.Close()
+				conns[i].cc = nil
+			}
 		}
 	}
-	defer reset()
+	defer resetAll()
 	exit = func(code int) {
 		// since defers aren't run by os.Exit...
-		reset()
+		resetAll()
 		os.Exit(code)
 	}
 
-	methods, err := getMethods(descSource, configs)
-	if err != nil {
-		fail(err, "Failed to compute set of methods to expose")
-	}
-	allFiles, err := grpcurl.GetAllFiles(descSource)
-	if err != nil {
-		fail(err, "Failed to enumerate all proto files")
+	// -----------------------------------------------------------------------
+	// Build the top-level HTTP handler.
+	// -----------------------------------------------------------------------
+
+	var handler http.Handler
+	if len(endpoints) == 1 {
+		// Single endpoint: serve directly at "/" for full backward compatibility.
+		handler = endpoints[0].Handler
+	} else {
+		// Multiple endpoints: selector page at "/" + sub-handlers at /endpoint/<n>/.
+		fmt.Printf("Multiple endpoints configured:\n")
+		for i, ep := range endpoints {
+			fmt.Printf("  [%d] %s  \u2192  /endpoint/%d/\n", i, ep.Target, i)
+		}
+		handler = standalone.MultiEndpointHandler(endpoints, standalone.WithMultiTitle(*title))
 	}
 
-	// can go ahead and close reflection client now
-	if refClient != nil {
-		refClient.Reset()
-		refClient = nil
-	}
-
-	var handlerOpts []standalone.HandlerOption
-	if len(defHeaders) > 0 {
-		handlerOpts = append(handlerOpts, standalone.WithDefaultMetadata(defHeaders))
-	}
-	if len(addlHeaders) > 0 || len(rpcHeaders) > 0 {
-		handlerOpts = append(handlerOpts, standalone.WithMetadata(append(addlHeaders, rpcHeaders...)))
-	}
-	if len(prsvHeaders) > 0 {
-		handlerOpts = append(handlerOpts, standalone.PreserveHeaders(prsvHeaders))
-	}
-	if verbosity > 0 {
-		handlerOpts = append(handlerOpts, standalone.WithInvokeVerbosity(verbosity))
-	}
-	if *title != "" {
-		handlerOpts = append(handlerOpts, standalone.WithTitle(*title))
-	}
-	if debug.set {
-		handlerOpts = append(handlerOpts, standalone.WithClientDebug(debug.val))
-	}
-	if examplesOpt != nil {
-		handlerOpts = append(handlerOpts, examplesOpt)
-	}
-	handlerOpts = append(handlerOpts, standalone.EmitDefaults(*emitDefaults))
-	handlerOpts = append(handlerOpts, configureJSandCSS(extraJS, standalone.AddJSFile)...)
-	handlerOpts = append(handlerOpts, configureJSandCSS(extraCSS, standalone.AddCSSFile)...)
-	handlerOpts = append(handlerOpts, configureAssets(otherAssets)...)
-	handlerOpts = append(handlerOpts, standalone.WithGRPCOptions(gRPCOptions))
-
-	handler := standalone.Handler(cc, target, methods, allFiles, handlerOpts...)
 	if *maxTime > 0 {
 		timeout := floatSecondsToDuration(*maxTime)
 		// enforce the timeout by wrapping the handler and inserting a
@@ -751,11 +803,15 @@ func main() {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `Usage:
-	%s [flags] [address]
+	%s [flags] address [address ...]
 
-Starts a web server that hosts a web UI for sending RPCs to the given address.
+Starts a web server that hosts a web UI for sending RPCs to the given address(es).
 
-The address will typically be in the form "host:port" where host can be an IP
+When a single address is provided the UI connects to that endpoint directly.
+When multiple addresses are provided a selector page is shown at the root URL,
+allowing the user to choose which endpoint to interact with.
+
+Each address will typically be in the form "host:port" where host can be an IP
 address or a hostname and port is a numeric port or service name. If an IPv6
 address is given, it must be surrounded by brackets, like "[2001:db8::1]". For
 Unix variants, if a -unix=true flag is present, then the address must be the
