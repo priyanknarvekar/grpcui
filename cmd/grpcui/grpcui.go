@@ -414,7 +414,6 @@ func main() {
 		fail(nil, "This program requires at least one arg: the host:port of a gRPC server.")
 	}
 	targets := flags.Args()
-	target := targets[0] // primary target (used for single-endpoint path & display)
 
 	if len(protoset) > 0 && len(reflHeaders) > 0 {
 		warn("The -reflect-header argument is not used when -protoset files are used.")
@@ -442,8 +441,8 @@ func main() {
 		reflection.val = false
 	}
 
-	configs, err := computeSvcConfigs()
-	if err != nil {
+	// Validate service/method configs early (before lazy connect).
+	if _, err := computeSvcConfigs(); err != nil {
 		fail(err, "Invalid services/methods indicated")
 	}
 
@@ -500,18 +499,16 @@ func main() {
 	if *connectTimeout > 0 {
 		dialTime = floatSecondsToDuration(*connectTimeout)
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, dialTime)
-	defer cancel()
-	var opts []grpc.DialOption
+	var dialOpts []grpc.DialOption
 	if *keepaliveTime > 0 {
 		timeout := floatSecondsToDuration(*keepaliveTime)
-		opts = append(opts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
+		dialOpts = append(dialOpts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:    timeout,
 			Timeout: timeout,
 		}))
 	}
 	if *maxMsgSz > 0 {
-		opts = append(opts, grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(*maxMsgSz)))
+		dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(*maxMsgSz)))
 	}
 
 	if *expandHeaders {
@@ -556,77 +553,33 @@ func main() {
 		}
 
 		if overrideName != "" {
-			opts = append(opts, grpc.WithAuthority(overrideName))
+			dialOpts = append(dialOpts, grpc.WithAuthority(overrideName))
 		}
 	} else if *authority != "" {
-		opts = append(opts, grpc.WithAuthority(*authority))
+		dialOpts = append(dialOpts, grpc.WithAuthority(*authority))
 	}
 	network := "tcp"
 	if isUnixSocket != nil && isUnixSocket() {
 		network = "unix"
 	}
-	cc, err := dial(dialCtx, network, target, creds, *connectFailFast, opts...)
-	if err != nil {
-		fail(err, "Failed to dial target host %q", target)
-	}
 
 	// -----------------------------------------------------------------------
-	// Dial all targets (starting with the already-dialed primary) and build a
-	// handler per endpoint.
+	// Build lazy endpoint configs — no gRPC dials happen at startup.
+	// Connections are established on-demand when the user selects an endpoint.
 	// -----------------------------------------------------------------------
 
 	type connState struct {
-		cc        *grpc.ClientConn
-		refClient *grpcreflect.Client
+		cc *grpc.ClientConn
 	}
 
-	buildEndpointHandler := func(cc *grpc.ClientConn, t string) (http.Handler, *grpcreflect.Client) {
-		var descSource grpcurl.DescriptorSource
-		var refClient *grpcreflect.Client
-		var fileSource grpcurl.DescriptorSource
-		if len(protoset) > 0 {
-			var err error
-			fileSource, err = grpcurl.DescriptorSourceFromProtoSets(protoset...)
-			if err != nil {
-				fail(err, "Failed to process proto descriptor sets.")
-			}
-		} else if len(protoFiles) > 0 {
-			var err error
-			fileSource, err = grpcurl.DescriptorSourceFromProtoFiles(importPaths, protoFiles...)
-			if err != nil {
-				fail(err, "Failed to process proto source files.")
-			}
-		}
-		if reflection.val {
-			md := grpcurl.MetadataFromHeaders(append(addlHeaders, reflHeaders...))
-			refCtx := metadata.NewOutgoingContext(ctx, md)
-			refClient = grpcreflect.NewClientAuto(refCtx, cc)
-			refClient.AllowMissingFileDescriptors()
-			reflSource := grpcurl.DescriptorSourceFromServer(ctx, refClient)
-			if fileSource != nil {
-				descSource = compositeSource{reflSource, fileSource}
-			} else {
-				descSource = reflSource
-			}
-		} else {
-			descSource = fileSource
-		}
+	var (
+		connsMu sync.Mutex
+		conns   []connState
+	)
 
-		epMethods, err := getMethods(descSource, configs)
-		if err != nil {
-			fail(err, "Failed to compute set of methods to expose for %q", t)
-		}
-		allFiles, err := grpcurl.GetAllFiles(descSource)
-		if err != nil {
-			fail(err, "Failed to enumerate all proto files for %q", t)
-		}
-
-		// Close reflection client now that schema is resolved.
-		if refClient != nil {
-			refClient.Reset()
-			refClient = nil
-		}
-
+	// buildHandlerOptions returns the standalone.HandlerOption slice that is
+	// shared across all endpoints (same CLI flags apply to every target).
+	buildHandlerOptions := func() []standalone.HandlerOption {
 		var hopts []standalone.HandlerOption
 		if len(defHeaders) > 0 {
 			hopts = append(hopts, standalone.WithDefaultMetadata(defHeaders))
@@ -654,36 +607,93 @@ func main() {
 		hopts = append(hopts, configureJSandCSS(extraCSS, standalone.AddCSSFile)...)
 		hopts = append(hopts, configureAssets(otherAssets)...)
 		hopts = append(hopts, standalone.WithGRPCOptions(gRPCOptions))
-
-		return standalone.Handler(cc, t, epMethods, allFiles, hopts...), refClient
+		return hopts
 	}
 
-	// collect all connections so we can close them on exit
-	var conns []connState
+	// makeConnectFunc returns a closure that lazily dials + reflects + builds
+	// the HTTP handler for the given target. Each call creates a fresh
+	// connection (used for both initial connect and refresh).
+	makeConnectFunc := func(t string) func() (http.Handler, error) {
+		return func() (http.Handler, error) {
+			dialCtx, dialCancel := context.WithTimeout(ctx, dialTime)
+			defer dialCancel()
 
-	// Build handler for the primary (already-dialed) target.
-	primaryHandler, primaryRefClient := buildEndpointHandler(cc, target)
-	conns = append(conns, connState{cc: cc, refClient: primaryRefClient})
+			cc, err := dial(dialCtx, network, t, creds, false, dialOpts...)
+			if err != nil {
+				return nil, fmt.Errorf("failed to dial %q: %w", t, err)
+			}
 
-	endpoints := []standalone.EndpointInfo{{Target: target, Handler: primaryHandler}}
+			// Track the connection for cleanup.
+			connsMu.Lock()
+			conns = append(conns, connState{cc: cc})
+			connsMu.Unlock()
 
-	// Dial any additional targets.
-	for _, t := range targets[1:] {
-		extraCC, err := dial(dialCtx, network, t, creds, *connectFailFast, opts...)
-		if err != nil {
-			fail(err, "Failed to dial target host %q", t)
+			var descSource grpcurl.DescriptorSource
+			var fileSource grpcurl.DescriptorSource
+			if len(protoset) > 0 {
+				fileSource, err = grpcurl.DescriptorSourceFromProtoSets(protoset...)
+				if err != nil {
+					cc.Close()
+					return nil, fmt.Errorf("failed to process proto descriptor sets: %w", err)
+				}
+			} else if len(protoFiles) > 0 {
+				fileSource, err = grpcurl.DescriptorSourceFromProtoFiles(importPaths, protoFiles...)
+				if err != nil {
+					cc.Close()
+					return nil, fmt.Errorf("failed to process proto source files: %w", err)
+				}
+			}
+			if reflection.val {
+				md := grpcurl.MetadataFromHeaders(append(addlHeaders, reflHeaders...))
+				refCtx := metadata.NewOutgoingContext(ctx, md)
+				refClient := grpcreflect.NewClientAuto(refCtx, cc)
+				refClient.AllowMissingFileDescriptors()
+				reflSource := grpcurl.DescriptorSourceFromServer(ctx, refClient)
+				if fileSource != nil {
+					descSource = compositeSource{reflSource, fileSource}
+				} else {
+					descSource = reflSource
+				}
+			} else {
+				descSource = fileSource
+			}
+
+			// Re-compute configs each time since getMethods mutates the map.
+			cfgs, err := computeSvcConfigs()
+			if err != nil {
+				cc.Close()
+				return nil, fmt.Errorf("invalid services/methods: %w", err)
+			}
+
+			epMethods, err := getMethods(descSource, cfgs)
+			if err != nil {
+				cc.Close()
+				return nil, fmt.Errorf("failed to compute methods for %q: %w", t, err)
+			}
+			allFiles, err := grpcurl.GetAllFiles(descSource)
+			if err != nil {
+				cc.Close()
+				return nil, fmt.Errorf("failed to enumerate proto files for %q: %w", t, err)
+			}
+
+			hopts := buildHandlerOptions()
+			return standalone.Handler(cc, t, epMethods, allFiles, hopts...), nil
 		}
-		epHandler, epRefClient := buildEndpointHandler(extraCC, t)
-		conns = append(conns, connState{cc: extraCC, refClient: epRefClient})
-		endpoints = append(endpoints, standalone.EndpointInfo{Target: t, Handler: epHandler})
+	}
+
+	// Build lazy endpoint descriptors for all targets.
+	endpoints := make([]standalone.EndpointInfo, len(targets))
+	for i, t := range targets {
+		endpoints[i] = standalone.EndpointInfo{
+			Target:      t,
+			ConnectFunc: makeConnectFunc(t),
+		}
 	}
 
 	resetAll := func() {
+		connsMu.Lock()
+		defer connsMu.Unlock()
 		for i := range conns {
-			if conns[i].refClient != nil {
-				conns[i].refClient.Reset()
-				conns[i].refClient = nil
-			}
 			if conns[i].cc != nil {
 				conns[i].cc.Close()
 				conns[i].cc = nil
@@ -699,20 +709,16 @@ func main() {
 
 	// -----------------------------------------------------------------------
 	// Build the top-level HTTP handler.
+	// All endpoints use MultiEndpointHandler (single-endpoint auto-redirects).
 	// -----------------------------------------------------------------------
 
-	var handler http.Handler
-	if len(endpoints) == 1 {
-		// Single endpoint: serve directly at "/" for full backward compatibility.
-		handler = endpoints[0].Handler
-	} else {
-		// Multiple endpoints: selector page at "/" + sub-handlers at /endpoint/<n>/.
-		fmt.Printf("Multiple endpoints configured:\n")
-		for i, ep := range endpoints {
-			fmt.Printf("  [%d] %s  \u2192  /endpoint/%d/\n", i, ep.Target, i)
-		}
-		handler = standalone.MultiEndpointHandler(endpoints, standalone.WithMultiTitle(*title))
+	fmt.Printf("Endpoints configured (lazy connect):\n")
+	for i, ep := range endpoints {
+		fmt.Printf("  [%d] %s  →  /endpoint/%d/\n", i, ep.Target, i)
 	}
+
+	var handler http.Handler
+	handler = standalone.MultiEndpointHandler(endpoints, standalone.WithMultiTitle(*title))
 
 	if *maxTime > 0 {
 		timeout := floatSecondsToDuration(*maxTime)
