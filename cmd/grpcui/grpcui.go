@@ -677,6 +677,11 @@ func main() {
 			}
 
 			hopts := buildHandlerOptions()
+			// In multi-endpoint mode, add a "Back to Catalog" button
+			// that links to the root selector page.
+			if len(targets) > 1 {
+				hopts = append(hopts, standalone.WithCatalogURL("/"))
+			}
 			return standalone.Handler(cc, t, epMethods, allFiles, hopts...), nil
 		}
 	}

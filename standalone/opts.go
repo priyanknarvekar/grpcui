@@ -24,6 +24,11 @@ type WebFormContainerTemplateData struct {
 	// AddlResources are additional CSS and JS files, in the form of <link> and <script>
 	// tags, that we want to append to the HEAD of the index template.
 	AddlResources []template.HTML
+
+	// CatalogURL, when non-empty, causes a "Back to Catalog" button to be
+	// rendered in the page header. This is set automatically when using
+	// MultiEndpointHandler.
+	CatalogURL string
 }
 
 // HandlerOption instances allow for configuration of the standalone Handler.
@@ -235,6 +240,15 @@ func WithTitle(title string) HandlerOption {
 	})
 }
 
+// WithCatalogURL sets the URL for a "Back to Catalog" button that is shown in
+// the page header. When empty (the default), no button is rendered. This is
+// set automatically by MultiEndpointHandler for each endpoint sub-handler.
+func WithCatalogURL(url string) HandlerOption {
+	return optFunc(func(opts *handlerOptions) {
+		opts.catalogURL = url
+	})
+}
+
 // optFunc implements HandlerOption
 type optFunc func(opts *handlerOptions)
 
@@ -258,6 +272,7 @@ type handlerOptions struct {
 
 	gRPCurlOptions      []string
 	title               string
+	catalogURL          string
 }
 
 func (opts *handlerOptions) addlServedResources() []*resource {
